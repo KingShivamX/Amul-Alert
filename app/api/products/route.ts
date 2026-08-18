@@ -25,25 +25,7 @@ const DEFAULT_PRODUCTS = [
 export async function GET() {
   try {
     await dbConnect();
-    let products = await Product.find({}).sort({ createdAt: -1 });
-
-    // Seed defaults if empty
-    if (products.length === 0) {
-      console.log("Seeding default products into MongoDB...");
-      for (const prod of DEFAULT_PRODUCTS) {
-        const scraped = await fetchAndScrapeProduct(prod.url);
-        await Product.create({
-          name: scraped.name !== "Amul Product" ? scraped.name : prod.name,
-          url: prod.url,
-          image: scraped.image || "",
-          price: scraped.price || "",
-          availability: scraped.availability,
-          isMonitoring: true,
-          lastChecked: new Date(),
-        });
-      }
-      products = await Product.find({}).sort({ createdAt: -1 });
-    }
+    const products = await Product.find({}).sort({ createdAt: -1 });
 
     return NextResponse.json({ success: true, products });
   } catch (error: any) {

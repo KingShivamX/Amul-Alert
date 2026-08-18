@@ -3,7 +3,7 @@ import { dbConnect } from "@/lib/db";
 import Product from "@/models/Product";
 import NotificationLog from "@/models/NotificationLog";
 import { fetchAndScrapeProduct } from "@/lib/scraper";
-import { sendStockAlertEmail } from "@/lib/email";
+import { sendBulkStockAlertEmail, AvailableProductItem } from "@/lib/email";
 
 export async function GET() {
   try {
@@ -12,6 +12,10 @@ export async function GET() {
     // Fetch products where isMonitoring is true
     const productsToMonitor = await Product.find({ isMonitoring: true });
     const results = [];
+    const availableItemsToAlert: AvailableProductItem[] = [];
+
+    const now = new Date();
+    const thirtyMinsAgo = new Date(now.getTime() - 30 * 60 * 1000);
 
     for (const prod of productsToMonitor) {
       console.log(`[MONITOR] Checking stock for: ${prod.name} (${prod.url})`);
@@ -19,7 +23,6 @@ export async function GET() {
 
       const oldStatus = prod.availability;
       const newStatus = scraped.availability;
-      const now = new Date();
 
       // Update fields
       prod.availability = newStatus;
@@ -34,47 +37,21 @@ export async function GET() {
       if (newStatus === "AVAILABLE") {
         prod.lastAvailable = now;
 
-        // Trigger Alert if:
-        // 1) Status flipped from OUT_OF_STOCK / UNKNOWN to AVAILABLE
-        // 2) Or last notification was sent > 30 minutes ago (prevent email spam)
-        const thirtyMinsAgo = new Date(now.getTime() - 30 * 60 * 1000);
+        // Check if should be included in alert email:
+        // 1) Status flipped to AVAILABLE
+        // 2) Or last notification sent > 30 mins ago
         const shouldAlert =
           oldStatus !== "AVAILABLE" ||
           !prod.lastNotificationSent ||
           prod.lastNotificationSent < thirtyMinsAgo;
 
         if (shouldAlert) {
-          console.log(`[ALERT] Product ${prod.name} IS AVAILABLE! Sending email alert...`);
-          try {
-            await sendStockAlertEmail({
-              productName: prod.name,
-              productUrl: prod.url,
-              price: prod.price,
-              image: prod.image,
-            });
-
-            prod.lastNotificationSent = now;
-
-            await NotificationLog.create({
-              productId: prod._id,
-              productName: prod.name,
-              recipientEmail: process.env.ALERT_RECIPIENT_EMAIL || process.env.EMAIL_USER,
-              status: "SUCCESS",
-              message: `Email alert sent successfully for ${prod.name}`,
-              sentAt: now,
-            });
-          } catch (emailErr: any) {
-            console.error(`[ALERT ERROR] Failed to send email for ${prod.name}:`, emailErr);
-            await NotificationLog.create({
-              productId: prod._id,
-              productName: prod.name,
-              recipientEmail: process.env.ALERT_RECIPIENT_EMAIL || process.env.EMAIL_USER,
-              status: "FAILED",
-              message: `Failed to send email alert`,
-              error: emailErr?.message || String(emailErr),
-              sentAt: now,
-            });
-          }
+          availableItemsToAlert.push({
+            name: prod.name,
+            url: prod.url,
+            price: prod.price,
+            image: prod.image,
+          });
         }
       }
 
@@ -87,10 +64,57 @@ export async function GET() {
       });
     }
 
+    // Send SINGLE consolidated email if any product is available
+    if (availableItemsToAlert.length > 0) {
+      console.log(
+        `[ALERT] ${availableItemsToAlert.length} available products found! Sending single consolidated email...`
+      );
+      try {
+        await sendBulkStockAlertEmail(availableItemsToAlert);
+
+        // Update lastNotificationSent for alerted products & create logs
+        for (const item of availableItemsToAlert) {
+          const matchedProd = productsToMonitor.find((p) => p.url === item.url);
+          if (matchedProd) {
+            matchedProd.lastNotificationSent = now;
+            await matchedProd.save();
+
+            await NotificationLog.create({
+              productId: matchedProd._id,
+              productName: matchedProd.name,
+              recipientEmail: process.env.ALERT_RECIPIENT_EMAIL || process.env.EMAIL_USER,
+              status: "SUCCESS",
+              message: `Included in consolidated email alert for ${availableItemsToAlert.length} available items`,
+              sentAt: now,
+            });
+          }
+        }
+      } catch (emailErr: any) {
+        console.error(`[ALERT ERROR] Failed to send consolidated email:`, emailErr);
+        for (const item of availableItemsToAlert) {
+          const matchedProd = productsToMonitor.find((p) => p.url === item.url);
+          if (matchedProd) {
+            await NotificationLog.create({
+              productId: matchedProd._id,
+              productName: matchedProd.name,
+              recipientEmail: process.env.ALERT_RECIPIENT_EMAIL || process.env.EMAIL_USER,
+              status: "FAILED",
+              message: `Failed to send email alert`,
+              error: emailErr?.message || String(emailErr),
+              sentAt: now,
+            });
+          }
+        }
+      }
+    } else {
+      console.log(`[MONITOR] No available items requiring email alerts.`);
+    }
+
     return NextResponse.json({
       success: true,
-      timestamp: new Date().toISOString(),
+      timestamp: now.toISOString(),
       checkedCount: productsToMonitor.length,
+      alertedCount: availableItemsToAlert.length,
       results,
     });
   } catch (error: any) {
